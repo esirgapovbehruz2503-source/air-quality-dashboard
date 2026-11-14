@@ -14,3 +14,11 @@
    python -m venv .venv
    # Windows PowerShell:
    .venv\Scripts\Activate.ps1
+   
+## Checkpoint 2: Reliable Collection, SQL Queries & Data Quality
+* **Checkpoint 2 Value Statement:** This component enables an urban resident or environmental information enthusiast to track multi-city CAMS air-quality collection across a 21-day schedule, inspect latest and daily-average PM2.5 estimates, and audit missing intervals without duplicate or revision corruption, resulting in a transparent, queryable 420-slot dataset.
+
+### Run Assessed Collection & Stakeholder Queries
+1. **Run scheduled assessed collection (marks expired slots missed and collects due 6-hour UTC slots):**
+   ```bash
+   python -m src.collector --mode assessed

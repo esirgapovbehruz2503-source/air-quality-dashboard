@@ -1,3 +1,4 @@
+import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -8,6 +9,7 @@ from typing import Any
 import requests
 
 from src.database import (
+    ASSESSED_DB_PATH,
     DEV_DB_PATH,
     format_utc,
     generate_collection_schedule,
@@ -15,10 +17,12 @@ from src.database import (
     initialize_database,
     seed_locations,
 )
+from src.queries import get_collection_monitoring_summary
 from src.validation import ValidationError, parse_open_meteo_payload
 
 OPEN_METEO_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 DEFAULT_DEV_ARCHIVE_DIR = DEV_DB_PATH.parent / "raw_responses"
+DEFAULT_ASSESSED_ARCHIVE_DIR = ASSESSED_DB_PATH.parent / "raw_responses"
 
 
 def compute_response_hash(raw_text: str) -> str:
@@ -39,12 +43,28 @@ def build_request_params(latitude: float, longitude: float) -> dict[str, Any]:
     }
 
 
+def mark_expired_slots_missed(conn: sqlite3.Connection, now_utc_str: str) -> int:
+    """Mark pending slots whose 30-minute acceptance deadline has passed as missed."""
+    cursor = conn.execute(
+        """
+        UPDATE collection_slots
+        SET slot_status = 'missed'
+        WHERE slot_status = 'pending'
+          AND acceptance_deadline_utc < ?
+        """,
+        (now_utc_str,),
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
 def collect_slot(
     conn: sqlite3.Connection,
     slot_id: int,
     archive_dir: Path | None = None,
     timeout_seconds: int = 15,
     session: requests.Session | None = None,
+    now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """
     Fetch, validate, and persist an observation for a scheduled collection_slot.
@@ -64,7 +84,7 @@ def collect_slot(
 
     http_client = session or requests
     params = build_request_params(slot["requested_latitude"], slot["requested_longitude"])
-    requested_at_utc = format_utc(datetime.now(timezone.utc))
+    requested_at_utc = format_utc(now_utc or datetime.now(timezone.utc))
 
     try:
         response = http_client.get(OPEN_METEO_URL, params=params, timeout=timeout_seconds)
@@ -80,7 +100,7 @@ def collect_slot(
         conn.commit()
         return {"slot_id": slot_id, "status": "network_error", "error": str(exc)}
 
-    responded_at_utc = format_utc(datetime.now(timezone.utc))
+    responded_at_utc = format_utc(now_utc or datetime.now(timezone.utc))
     raw_text = response.text
     resp_hash = compute_response_hash(raw_text)
 
@@ -258,6 +278,53 @@ def collect_slot(
     }
 
 
+def collect_due_slots(
+    conn: sqlite3.Connection,
+    archive_dir: Path | None = None,
+    now_utc: datetime | None = None,
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    """
+    Mark expired pending slots as missed and collect all pending slots currently
+    inside their [scheduled_collection_utc, acceptance_deadline_utc] window.
+    """
+    effective_now = now_utc or datetime.now(timezone.utc)
+    now_str = format_utc(effective_now)
+    missed_marked = mark_expired_slots_missed(conn, now_str)
+
+    due_slots = conn.execute(
+        """
+        SELECT slot_id
+        FROM collection_slots
+        WHERE slot_status = 'pending'
+          AND scheduled_collection_utc <= ?
+          AND acceptance_deadline_utc >= ?
+        ORDER BY scheduled_collection_utc ASC, location_id ASC
+        """,
+        (now_str, now_str),
+    ).fetchall()
+
+    results = []
+    if due_slots:
+        active_session = session or requests.Session()
+        for row in due_slots:
+            results.append(
+                collect_slot(
+                    conn,
+                    row["slot_id"],
+                    archive_dir=archive_dir,
+                    session=active_session,
+                    now_utc=now_utc,
+                )
+            )
+
+    return {
+        "checked_at_utc": now_str,
+        "missed_marked": missed_marked,
+        "due_collected": results,
+    }
+
+
 def run_mvp_demo(db_path: Path = DEV_DB_PATH, archive_dir: Path = DEFAULT_DEV_ARCHIVE_DIR) -> None:
     """Collect and retrieve one genuine live record for the next open 6-hour UTC slot."""
     initialize_database(db_path)
@@ -302,5 +369,39 @@ def run_mvp_demo(db_path: Path = DEV_DB_PATH, archive_dir: Path = DEFAULT_DEV_AR
         for row in retrieved:
             print("Retrieved record:", dict(row))
 
+
+def run_assessed_collection(
+    db_path: Path = ASSESSED_DB_PATH,
+    archive_dir: Path = DEFAULT_ASSESSED_ARCHIVE_DIR,
+) -> None:
+    """Initialize assessed DB (if new) and collect any currently due 6-hour UTC slots."""
+    initialize_database(db_path)
+    now = datetime.now(timezone.utc)
+
+    with get_connection(db_path) as conn:
+        seed_locations(conn)
+        existing_slots = conn.execute("SELECT COUNT(*) FROM collection_slots").fetchone()[0]
+        if existing_slots == 0:
+            generate_collection_schedule(conn, start_date_utc=now, days=21, delay_minutes=30)
+
+        outcome = collect_due_slots(conn, archive_dir=archive_dir, now_utc=now)
+        summary = get_collection_monitoring_summary(conn)
+
+    print("Assessed run:", outcome)
+    print("Monitoring summary:", summary)
+
+
 if __name__ == "__main__":
-    run_mvp_demo()
+    parser = argparse.ArgumentParser(description="Open-Meteo CAMS air quality collector.")
+    parser.add_argument(
+        "--mode",
+        choices=["demo", "assessed"],
+        default="demo",
+        help="Use 'demo' for development DB or 'assessed' for the 21-day assessed DB.",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "assessed":
+        run_assessed_collection()
+    else:
+        run_mvp_demo()

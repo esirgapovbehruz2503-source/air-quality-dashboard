@@ -6,6 +6,7 @@ from typing import Iterable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "database" / "schema.sql"
 DEV_DB_PATH = PROJECT_ROOT / "data" / "development" / "air_quality_dev.db"
+ASSESSED_DB_PATH = PROJECT_ROOT / "data" / "assessed" / "air_quality_assessed.db"
 
 APPROVED_LOCATIONS = [
     ("London", 51.5074, -0.1278),
@@ -21,6 +22,15 @@ COLLECTION_HOURS_UTC = (0, 6, 12, 18)
 def format_utc(dt: datetime) -> str:
     """Format a timezone-aware datetime as YYYY-MM-DDTHH:MM:SSZ."""
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def next_six_hour_utc(dt: datetime) -> datetime:
+    """Return the exact 6-hour UTC slot at or immediately after dt."""
+    utc_dt = dt.astimezone(timezone.utc)
+    floored = utc_dt.replace(hour=(utc_dt.hour // 6) * 6, minute=0, second=0, microsecond=0)
+    if utc_dt > floored:
+        return floored + timedelta(hours=6)
+    return floored
 
 
 def get_connection(db_path: Path | str) -> sqlite3.Connection:
@@ -69,12 +79,11 @@ def generate_collection_schedule(
     delay_minutes: int = 30,
 ) -> tuple[int, int]:
     """
-    Generate scheduled 6-hourly slots and T -> T+6h prediction opportunities.
-    Returns (slots_created, opportunities_created).
+    Generate (days * 4) consecutive 6-hourly slots per location and T -> T+6h
+    prediction opportunities. Returns (slots_created, opportunities_created).
     """
-    base_day = start_date_utc.astimezone(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    first_slot = next_six_hour_utc(start_date_utc)
+    total_steps = days * len(COLLECTION_HOURS_UTC)
     location_rows = conn.execute("SELECT location_id FROM locations ORDER BY location_id").fetchall()
 
     slots_before = conn.execute("SELECT COUNT(*) FROM collection_slots").fetchone()[0]
@@ -84,27 +93,25 @@ def generate_collection_schedule(
         loc_id = loc["location_id"]
         slot_times: list[datetime] = []
 
-        for day_offset in range(days):
-            for hour in COLLECTION_HOURS_UTC:
-                scheduled_dt = base_day + timedelta(days=day_offset, hours=hour)
-                deadline_dt = scheduled_dt + timedelta(minutes=delay_minutes)
-                slot_times.append(scheduled_dt)
+        for step in range(total_steps):
+            scheduled_dt = first_slot + timedelta(hours=6 * step)
+            deadline_dt = scheduled_dt + timedelta(minutes=delay_minutes)
+            slot_times.append(scheduled_dt)
 
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO collection_slots (
-                        location_id, scheduled_collection_utc, required_valid_utc, acceptance_deadline_utc
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        loc_id,
-                        format_utc(scheduled_dt),
-                        format_utc(scheduled_dt),
-                        format_utc(deadline_dt),
-                    ),
-                )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO collection_slots (
+                    location_id, scheduled_collection_utc, required_valid_utc, acceptance_deadline_utc
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    loc_id,
+                    format_utc(scheduled_dt),
+                    format_utc(scheduled_dt),
+                    format_utc(deadline_dt),
+                ),
+            )
 
-        # Link each slot T to its exact T+6h target slot for the same location
         for source_dt in slot_times:
             target_dt = source_dt + timedelta(hours=6)
             if target_dt not in slot_times:
